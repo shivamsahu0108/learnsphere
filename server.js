@@ -1,4 +1,5 @@
 const express = require("express");
+const path = require("path");
 const cors = require("cors");
 const bcrypt = require("bcryptjs");
 const nodemailer = require("nodemailer");
@@ -20,36 +21,29 @@ dotenv.config();
 // CLOUDFLARE R2 CONFIGURATION
 // ==================================================
 
-const r2Client = new S3Client({
-  region: "auto",
+const hasR2Config = Boolean(
+  process.env.R2_ACCOUNT_ID &&
+  process.env.R2_ACCESS_KEY_ID &&
+  process.env.R2_SECRET_ACCESS_KEY &&
+  process.env.R2_BUCKET_NAME
+);
 
-  endpoint:
-    `https://${process.env.R2_ACCOUNT_ID}.r2.cloudflarestorage.com`,
+const r2Client = hasR2Config
+  ? new S3Client({
+      region: "auto",
+      endpoint: `https://${process.env.R2_ACCOUNT_ID}.r2.cloudflarestorage.com`,
+      credentials: {
+        accessKeyId: process.env.R2_ACCESS_KEY_ID,
+        secretAccessKey: process.env.R2_SECRET_ACCESS_KEY
+      }
+    })
+  : null;
 
-  credentials: {
-    accessKeyId:
-      process.env.R2_ACCESS_KEY_ID,
+const R2_BUCKET_NAME = process.env.R2_BUCKET_NAME || "";
 
-    secretAccessKey:
-      process.env.R2_SECRET_ACCESS_KEY
-  }
-});
-
-const R2_BUCKET_NAME =
-  process.env.R2_BUCKET_NAME;
-
-// ==================================================
-// R2 CONFIGURATION CHECK
-// ==================================================
-
-if (
-  !process.env.R2_ACCOUNT_ID ||
-  !process.env.R2_ACCESS_KEY_ID ||
-  !process.env.R2_SECRET_ACCESS_KEY ||
-  !process.env.R2_BUCKET_NAME
-) {
+if (!hasR2Config) {
   console.warn(
-    "WARNING: Cloudflare R2 settings are incomplete. Check your .env file."
+    "WARNING: Cloudflare R2 settings are incomplete. Media streaming and downloads will be disabled until configured."
   );
 }
 
@@ -66,6 +60,7 @@ if (trustProxyValue === "1") {
 // Lightweight security headers that do not interfere with the current inline HTML/JS design.
 app.use((req, res, next) => {
   res.setHeader("X-Content-Type-Options", "nosniff");
+  res.setHeader("X-Frame-Options", "SAMEORIGIN");
   res.setHeader("Referrer-Policy", "strict-origin-when-cross-origin");
   res.setHeader("Permissions-Policy", "camera=(), microphone=(), geolocation=()");
 
@@ -80,28 +75,59 @@ const PORT = process.env.PORT || 5000;
 
 
 // ==================================================
-// MIDDLEWARE
+// MIDDLEWARE & CORS
 // ==================================================
 
-const allowedOrigins = (process.env.ALLOWED_ORIGINS ||
-  "http://localhost:5500,http://127.0.0.1:5500,http://localhost:3000,http://127.0.0.1:3000")
+const configuredOrigins = (process.env.ALLOWED_ORIGINS ||
+  "https://thelearnsphere.in,https://www.thelearnsphere.in,http://localhost:5500,http://127.0.0.1:5500,http://localhost:3000,http://127.0.0.1:3000")
   .split(",")
   .map(origin => origin.trim())
   .filter(Boolean);
 
-app.use(cors({
-  origin(origin, callback) {
-    // Non-browser requests and same-origin requests may have no Origin header.
-    if (!origin || allowedOrigins.includes(origin)) {
-      return callback(null, true);
+app.use(
+  cors((req, callback) => {
+    const origin = req.header("Origin");
+    const forwardedHost = req.header("x-forwarded-host");
+    const rawHost = forwardedHost ? forwardedHost.split(",")[0].trim() : req.get("host");
+    const hostWithoutPort = rawHost ? rawHost.split(":")[0] : "";
+
+    // Non-browser requests (curl, server-to-server, health checks)
+    if (!origin) {
+      return callback(null, { origin: true });
+    }
+
+    // Configured allowed origins or wildcard
+    if (configuredOrigins.includes(origin) || configuredOrigins.includes("*")) {
+      return callback(null, {
+        origin: true,
+        methods: ["GET", "POST", "PUT", "DELETE", "OPTIONS"],
+        allowedHeaders: ["Content-Type", "Authorization"],
+        credentials: false
+      });
+    }
+
+    // Dynamic same-origin detection (e.g. deployed domain matches incoming origin host)
+    try {
+      const originUrl = new URL(origin);
+      if (
+        (rawHost && (originUrl.host === rawHost || originUrl.hostname === hostWithoutPort)) ||
+        originUrl.hostname === "localhost" ||
+        originUrl.hostname === "127.0.0.1"
+      ) {
+        return callback(null, {
+          origin: true,
+          methods: ["GET", "POST", "PUT", "DELETE", "OPTIONS"],
+          allowedHeaders: ["Content-Type", "Authorization"],
+          credentials: false
+        });
+      }
+    } catch {
+      // Invalid URL format
     }
 
     return callback(new Error("Origin is not allowed by CORS."));
-  },
-  methods: ["GET", "POST", "PUT", "DELETE", "OPTIONS"],
-  allowedHeaders: ["Content-Type", "Authorization"],
-  credentials: false
-}));
+  })
+);
 
 app.use(
   express.json({
@@ -520,9 +546,25 @@ async function requireAdmin(
 
 
 // ==================================================
-// HEALTH CHECK
+// HEALTH CHECKS
 // ==================================================
 
+// Lightweight liveness probe for cloud load balancers / containers (Render, Railway, Docker, K8s)
+app.get("/health", (req, res) => {
+  res.status(200).json({
+    status: "ok",
+    timestamp: new Date().toISOString()
+  });
+});
+
+app.get("/api/healthz", (req, res) => {
+  res.status(200).json({
+    status: "ok",
+    timestamp: new Date().toISOString()
+  });
+});
+
+// Comprehensive readiness & diagnostics probe
 app.get(
   "/api/health",
   (req, res) => {
@@ -537,10 +579,7 @@ app.get(
         : "Learnsphere backend is running, but the database is unavailable.",
       database: healthy ? "connected" : "disconnected",
       r2Configured: Boolean(
-        process.env.R2_ACCOUNT_ID &&
-        process.env.R2_ACCESS_KEY_ID &&
-        process.env.R2_SECRET_ACCESS_KEY &&
-        process.env.R2_BUCKET_NAME
+        hasR2Config
       ),
       emailConfigured: Boolean(
         process.env.EMAIL_USER &&
@@ -561,6 +600,12 @@ app.get(
   authenticateToken,
   requireAdmin,
   async (req, res) => {
+    if (!r2Client) {
+      return res.status(503).json({
+        success: false,
+        message: "Cloudflare R2 is not configured on this server."
+      });
+    }
 
     try {
 
@@ -922,6 +967,13 @@ app.get(
   authenticateToken,
   requirePmpAccess,
   async (req, res) => {
+    if (!r2Client) {
+      return res.status(503).json({
+        success: false,
+        message: "Cloudflare R2 media storage is not configured on this server."
+      });
+    }
+
     try {
       const type = typeof req.query.type === "string"
         ? req.query.type
@@ -1146,6 +1198,13 @@ app.get(
   requirePmpAccess,
 
   async (req, res) => {
+
+    if (!r2Client) {
+      return res.status(503).json({
+        success: false,
+        message: "Cloudflare R2 media storage is not configured on this server."
+      });
+    }
 
     try {
 
@@ -1659,6 +1718,13 @@ app.get(
   authenticateVideoToken,
   requirePmpAccess,
   async (req, res) => {
+
+    if (!r2Client) {
+      return res.status(503).json({
+        success: false,
+        message: "Cloudflare R2 media storage is not configured on this server."
+      });
+    }
 
     try {
 
@@ -3626,6 +3692,75 @@ function escapeHtml(
 
 
 // ==================================================
+// FRONTEND STATIC ROUTING & SECURE PAGE SERVING
+// ==================================================
+
+const publicPages = {
+  "/": "index.html",
+  "/index": "index.html",
+  "/index.html": "index.html",
+  "/courses": "courses.html",
+  "/courses.html": "courses.html",
+  "/pmp-details": "pmp-details.html",
+  "/pmp-details.html": "pmp-details.html",
+  "/admin": "admin.html",
+  "/admin.html": "admin.html"
+};
+
+for (const [routePath, fileName] of Object.entries(publicPages)) {
+  app.get(routePath, (req, res) => {
+    res.sendFile(path.join(__dirname, fileName));
+  });
+}
+
+// Favicon handler
+app.get("/favicon.ico", (req, res) => {
+  res.status(204).end();
+});
+
+// Explicit 404 for unhandled API endpoints
+app.use("/api", (req, res) => {
+  res.status(404).json({
+    success: false,
+    message: `API endpoint ${req.method} ${req.originalUrl} not found.`
+  });
+});
+
+// Explicit 404 for unhandled web routes (safely blocks direct access to .env, server.js, package.json, etc.)
+app.use((req, res, next) => {
+  if (req.method !== "GET" && req.method !== "HEAD") {
+    return next();
+  }
+
+  res.status(404).send(`<!DOCTYPE html>
+<html lang="en">
+<head>
+  <meta charset="UTF-8">
+  <meta name="viewport" content="width=device-width, initial-scale=1.0">
+  <title>404 - Page Not Found | Learnsphere</title>
+  <style>
+    body { font-family: system-ui, -apple-system, sans-serif; display: flex; align-items: center; justify-content: center; min-height: 100vh; margin: 0; background: #0f172a; color: #f8fafc; text-align: center; }
+    .box { max-width: 480px; padding: 32px; }
+    h1 { font-size: 5rem; margin: 0; color: #6366f1; font-weight: 800; }
+    h2 { margin: 8px 0 16px; font-size: 1.5rem; }
+    p { color: #94a3b8; font-size: 1.05rem; line-height: 1.6; margin-bottom: 24px; }
+    a { display: inline-block; padding: 12px 28px; background: #4f46e5; color: white; text-decoration: none; border-radius: 8px; font-weight: 600; transition: background .2s ease; }
+    a:hover { background: #4338ca; }
+  </style>
+</head>
+<body>
+  <div class="box">
+    <h1>404</h1>
+    <h2>Page Not Found</h2>
+    <p>The page or resource you are looking for does not exist or has been moved.</p>
+    <a href="/">Return to Home</a>
+  </div>
+</body>
+</html>`);
+});
+
+
+// ==================================================
 // GLOBAL ERROR HANDLER
 // ==================================================
 
@@ -3655,7 +3790,10 @@ app.use((error, req, res, next) => {
 
 const requiredEnvironment = [
   "MONGO_URI",
-  "JWT_SECRET",
+  "JWT_SECRET"
+];
+
+const optionalR2Environment = [
   "R2_ACCOUNT_ID",
   "R2_ACCESS_KEY_ID",
   "R2_SECRET_ACCESS_KEY",
@@ -3670,6 +3808,16 @@ function validateEnvironment() {
   if (missing.length) {
     throw new Error(
       `Missing required environment variables: ${missing.join(", ")}`
+    );
+  }
+
+  const missingR2 = optionalR2Environment.filter(
+    key => !process.env[key] || !String(process.env[key]).trim()
+  );
+
+  if (missingR2.length) {
+    console.warn(
+      `WARNING: Cloudflare R2 variables not set: ${missingR2.join(", ")}. Media streaming features will be disabled.`
     );
   }
 

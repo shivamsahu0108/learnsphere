@@ -1,0 +1,40 @@
+services:
+  - type: web
+    name: learnsphere
+    env: node
+    plan: starter
+    buildCommand: npm install
+    startCommand: npm start
+    healthCheckPath: /health
+    autoDeploy: true
+    envVars:
+      - key: NODE_ENV
+        value: production
+      - key: PORT
+        value: 5000
+      - key: MONGO_URI
+        sync: false
+      - key: JWT_SECRET
+        generateValue: true
+      - key: ALLOWED_ORIGINS
+        value: https://thelearnsphere.in,https://www.thelearnsphere.in
+      - key: R2_ACCOUNT_ID
+        sync: false
+      - key: R2_ACCESS_KEY_ID
+        sync: false
+      - key: R2_SECRET_ACCESS_KEY
+        sync: false
+      - key: R2_BUCKET_NAME
+        value: learnsphere-pmp
+      - key: EMAIL_USER
+        sync: false
+      - key: EMAIL_PASS
+        sync: false
+      - key: RECEIVER_EMAIL
+        sync: false
+      - key: ENABLE_ADMIN_SETUP
+        value: "false"
+      - key: ADMIN_SETUP_SECRET
+        sync: false
+      - key: TRUST_PROXY
+        value: "1"

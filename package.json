@@ -4,10 +4,16 @@
   "description": "Learnsphere learning platform backend and deployment tools",
   "main": "server.js",
   "scripts": {
-    "test": "echo \"Error: no test specified\" && exit 1",
+    "test": "npm run test:syntax",
+    "build": "node --check server.js",
     "start": "node server.js",
+    "dev": "node --watch server.js",
     "test:syntax": "node --check server.js",
     "load-test": "node load-test.js"
+  },
+  "engines": {
+    "node": ">=18.0.0",
+    "npm": ">=9.0.0"
   },
   "keywords": [],
   "author": "Learnsphere",
