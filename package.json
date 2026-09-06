@@ -12,8 +12,8 @@
     "load-test": "node load-test.js"
   },
   "engines": {
-    "node": ">=18.0.0",
-    "npm": ">=9.0.0"
+    "node": ">=20.19.0",
+    "npm": ">=10.0.0"
   },
   "keywords": [],
   "author": "Learnsphere",
